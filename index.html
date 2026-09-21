@@ -246,8 +246,9 @@ var MODULES=[
    {t:'平均数、倍数与比值',n:25,min:70},
    {t:'综合分析题与常见陷阱识别',n:20,min:70},
    {t:'资料分析限时套题（4篇20题）',n:20,min:75}]},
- {id:'changshi',name:'常识判断',short:'常识',color:'#ff3b30',unit:'题',syl:[
+ {id:'changshi',name:'常识判断 / 政治理论',short:'常识',color:'#ff3b30',unit:'题',syl:[
    {t:'时政热点·近一年重要会议与文件',n:40,min:40},
+   {t:'政治理论·新思想与五位一体建设',n:40,min:40},
    {t:'法律·宪法与民法典高频考点',n:40,min:40},
    {t:'法律·刑法与行政法高频考点',n:40,min:40},
    {t:'政治·马克思主义原理与党史',n:40,min:40},
@@ -307,30 +308,46 @@ function defaultRating(){
   /* 申论按用户要求大幅降权（1.3），省下的时间按比例分给资料/言语/判断/数量 */
   return {yanyu:'mid',panding:'mid',shuliang:'mid',ziliao:'weak',changshi:'strong',shenlun:'strong',mianshi:'mid'};
 }
+/* 从粉笔抓到的真实数据（2026-09-21：总做题 1070 题、正确率 60.7%、估分 52、错题 415 道、申论 0 题） */
+var FENBI_ACC={yanyu:72.9,panding:59.8,shuliang:65,ziliao:40,changshi:48.4};
+function defaultProgress(){
+  var p={};
+  Object.keys(FENBI_ACC).forEach(function(id){p[id]={acc:FENBI_ACC[id],done:[]}});
+  return p;
+}
 function defaultConfig(){
   var t=todayStr();
   /* 2027 国考笔试占位日期：12 月第一个周日。近年国考笔试都落在 11 月底—12 月初的周日
      （2023-11-26、2024-12-01、2025-11-30），官方公告发布后改成准确日期即可。 */
   var exam='2026-12-06';
   if(diffDays(t,exam)<21)exam=addDays(t,120);
-  var rating=defaultRating();
-  return {
+  var cfg={
     preset:PRESET,
     examName:'国考（行测+申论）',examDate:exam,startDate:t,
     dailyHours:4,weekendFactor:1.5,windows:defaultWindows(),
     restDays:[0],restMode:'light',breakMinutes:10,intensity:1,
     weeklyReview:true,includeInterview:false,
-    rating:rating,weights:weightsFromRating(rating,false),
-    progress:{}   /* {模块id:{acc:正确率, done:[已学考点下标]}} —— 用来按现有进度定制 */
+    rating:defaultRating(),weights:{},
+    progress:defaultProgress(),
+    wrongBook:415,
+    progressNote:'正确率来自粉笔做题报告（抓取于 '+t+'）：总做题 1070 题、总正确率 60.7%、估分 52、错题本积压 415 道、申论暂未在粉笔练习。'
   };
+  cfg.weights=effWeights(cfg);
+  return cfg;
 }
 /* 把「粉笔/自测正确率」折算成时间权重：正确率越低，权重越高 */
+/* 正确率 → 权重：换算到和「弱/中/强」同一量纲（1.3~3），否则两套标准混在一起会算歪。
+   40% 及以下 = 3.0（等同「弱」），85% 及以上 = 1.3（等同「强」），中间线性过渡。 */
+function accWeight(acc){
+  if(typeof acc!=='number')return null;
+  return Math.round((3-1.7*clamp((acc-40)/45,0,1))*100)/100;
+}
 function effWeights(cfg){
   var ids=activeIds(cfg.includeInterview),raw={};
   ids.forEach(function(id){
     var p=(cfg.progress||{})[id]||{};
-    if(typeof p.acc==='number'&&p.acc>=0)raw[id]=Math.max(1,105-Math.min(100,p.acc));
-    else raw[id]=RATE[cfg.rating[id]]||2;
+    var aw=accWeight(p.acc);
+    raw[id]=(aw===null)?(RATE[cfg.rating[id]]||2):aw;
   });
   return roundW(raw,ids);
 }
@@ -627,6 +644,12 @@ function buildDay(dateStr,dayIdx,phase,cfg,ctx){
     lst.minutes=lst.minutes-30-cfg.breakMinutes;
     slots.push({si:lst.si,minutes:30,role:'review'});
   }
+  /* 错题本重做：错题积压多的话，每周三固定切一段 45 分钟 */
+  if(cfg.wrongBook>=100&&dow===3&&slots.length&&slots[slots.length-1].minutes>=100){
+    var lw=slots[slots.length-1];
+    lw.minutes=lw.minutes-45-cfg.breakMinutes;
+    slots.push({si:lw.si,minutes:45,role:'wrong'});
+  }
   /* 常识/时政：每天固定一小段，从最后一个时段切出 */
   if(!isMockDay){
     var tw=0;mods.forEach(function(m){tw+=(cfg.weights[m.id]||0)});
@@ -653,6 +676,10 @@ function buildDay(dateStr,dayIdx,phase,cfg,ctx){
       }
       if(sl.role==='review'){
         items.push({module:'fuxi',minutes:sl.minutes,kind:'复盘',task:'周复盘：统计本周各模块正确率、整理错题本、微调下周时间分配'});
+        return;
+      }
+      if(sl.role==='wrong'){
+        items.push({module:'fuxi',minutes:sl.minutes,kind:'错题本',task:'错题本重做：从粉笔错题本挑 '+Math.max(12,Math.round(sl.minutes/2.5))+' 道旧错题重做（优先资料分析、判断推理），全部弄懂再往下走'});
         return;
       }
       var id=picked[si2++]||cand2[0].id,mo=M[id],r=null;
@@ -987,8 +1014,10 @@ function viewSetup(){
     hint+
   '</div>'+
   '<div class="h2">③ 你的现有进度<button class="chip" style="margin-left:auto;padding:5px 10px;font-size:12px" data-act="accWeights">按正确率重算分配</button></div><div class="card tight">'+
-    '<div class="muted" style="font-size:12.5px;padding:2px 0 8px;line-height:1.65">把粉笔「做题报告／学习报告」里各模块的<b>正确率</b>填进来（选填），再点「已学考点」勾选你已经学完的部分。<br>系统会：正确率越低 → 分到的时间越多；已勾选的考点 → 生成时直接跳过，并相应压缩基础期。</div>'+
+    (c.progressNote?'<div class="banner" style="margin:0 0 10px">📊 '+esc(c.progressNote)+'</div>':'')+
+    '<div class="muted" style="font-size:12.5px;padding:2px 0 8px;line-height:1.65">把粉笔「做题报告／学习报告」里各模块的<b>正确率</b>填进来（选填），再点「已学考点」勾选你已经学完的部分。<br>系统会：正确率越低 → 分到的时间越多；已勾选的考点 → 生成时直接跳过，并相应压缩基础期。<br>注意：<b>常识/政治理论</b>是记忆类科目，固定按每天 15–30 分钟安排（靠日积月累，不按占比堆时长），所以它的占比数字不会全额兑现，省下的时间会自动分给其他模块。</div>'+
     mods.map(function(m){return progressRow(m,c)}).join('')+
+    '<div class="row" style="border-bottom:0"><div class="lab">错题本积压（题）<small>≥100 时，每周三自动排一段 45 分钟错题重做</small></div><div style="flex:0 0 82px"><input type="number" data-cfg="wrongBook" min="0" max="9000" step="5" value="'+(c.wrongBook||0)+'"></div></div>'+
     '<div class="btnrow"><button class="btn sec sm" data-act="accWeights">按正确率重算时间分配</button><button class="btn sec sm" data-act="rerate">按弱/中/强重算</button><button class="btn sec sm" data-act="clearProgress">清空进度</button></div>'+
   '</div>'+
   '<div class="h2">④ 时间分配（可拖动编辑）<span class="r" id="wsum">合计 '+Math.round(wsum)+'%</span></div><div class="card tight">'+
@@ -1393,17 +1422,17 @@ function init(){
   if(st&&st.config&&st.config.preset!==PRESET&&!(st.days||[]).some(function(d){
     return d.manual||(d.blocks||[]).some(function(b){return b.done});
   })){st=null}/* 还没动过的示例计划：直接换成国考预置参数 */
-  /* 一次性迁移：把默认的申论高占比调低（只在用户没动过相关设置、也没填进度时） */
+  /* 一次性迁移：把粉笔数据与新的默认（申论降权、错题本）应用到旧存档 */
   if(st&&st.config&&st.config.preset!==PRESET){
-    var cc=st.config;
-    var oldShenlun=(cc.rating&&cc.rating.shenlun==='weak')&&Math.abs(((cc.weights||{}).shenlun||0)-22.6)<0.25;
-    if(oldShenlun&&(!cc.progress||!Object.keys(cc.progress).length)){
-      cc.rating.shenlun='strong';
-      if(cc.rating.changshi==='mid')cc.rating.changshi='strong';
-      cc.preset=PRESET;
-      cc.weights=weightsFromRating(cc.rating,cc.includeInterview);
-      st.days=[];
-    }
+    var cc=st.config,nd=defaultConfig();
+    if(!cc.progress||!Object.keys(cc.progress).length){cc.progress=nd.progress}
+    if(cc.rating&&cc.rating.shenlun==='weak'&&Math.abs(((cc.weights||{}).shenlun||0)-22.6)<0.25){cc.rating.shenlun='strong'}
+    if(cc.rating&&cc.rating.changshi==='mid'){cc.rating.changshi='strong'}
+    if(!cc.wrongBook){cc.wrongBook=nd.wrongBook}
+    if(!cc.progressNote){cc.progressNote=nd.progressNote}
+    cc.preset=PRESET;
+    cc.weights=effWeights(cc);
+    st.days=[];   /* 让计划按新参数重排 */
   }
   if(st&&st.config){
     state={config:Object.assign(defaultConfig(),st.config),days:st.days||[],phases:st.phases||[],created:st.created||''};
