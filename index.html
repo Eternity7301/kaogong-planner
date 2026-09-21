@@ -295,7 +295,7 @@ function weightsFromRating(rating,inc){
   ids.forEach(function(id){raw[id]=RATE[rating[id]]||2});
   return roundW(raw,ids);
 }
-var PRESET='guokao2026c';
+var PRESET='guokao2026d';
 /* 时段：把每天切成几段来学，计划会把任务填进这些时段，段与段之间自然休息 */
 function defaultWindows(){
   return {
@@ -303,21 +303,54 @@ function defaultWindows(){
     weekend:[{s:'09:00',e:'11:30'},{s:'14:00',e:'17:30'}]
   };
 }
+function defaultRating(){
+  /* 申论按用户要求大幅降权（1.3），省下的时间按比例分给资料/言语/判断/数量 */
+  return {yanyu:'mid',panding:'mid',shuliang:'mid',ziliao:'weak',changshi:'strong',shenlun:'strong',mianshi:'mid'};
+}
 function defaultConfig(){
   var t=todayStr();
   /* 2027 国考笔试占位日期：12 月第一个周日。近年国考笔试都落在 11 月底—12 月初的周日
      （2023-11-26、2024-12-01、2025-11-30），官方公告发布后改成准确日期即可。 */
   var exam='2026-12-06';
   if(diffDays(t,exam)<21)exam=addDays(t,120);
-  var rating={yanyu:'mid',panding:'mid',shuliang:'mid',ziliao:'weak',changshi:'strong',shenlun:'weak',mianshi:'mid'};
+  var rating=defaultRating();
   return {
     preset:PRESET,
     examName:'国考（行测+申论）',examDate:exam,startDate:t,
     dailyHours:4,weekendFactor:1.5,windows:defaultWindows(),
     restDays:[0],restMode:'light',breakMinutes:10,intensity:1,
     weeklyReview:true,includeInterview:false,
-    rating:rating,weights:weightsFromRating(rating,false)
+    rating:rating,weights:weightsFromRating(rating,false),
+    progress:{}   /* {模块id:{acc:正确率, done:[已学考点下标]}} —— 用来按现有进度定制 */
   };
+}
+/* 把「粉笔/自测正确率」折算成时间权重：正确率越低，权重越高 */
+function effWeights(cfg){
+  var ids=activeIds(cfg.includeInterview),raw={};
+  ids.forEach(function(id){
+    var p=(cfg.progress||{})[id]||{};
+    if(typeof p.acc==='number'&&p.acc>=0)raw[id]=Math.max(1,105-Math.min(100,p.acc));
+    else raw[id]=RATE[cfg.rating[id]]||2;
+  });
+  return roundW(raw,ids);
+}
+function hasAcc(cfg){
+  return activeIds(cfg.includeInterview).some(function(id){
+    var p=(cfg.progress||{})[id]||{};
+    return typeof p.acc==='number'&&p.acc>=0;
+  });
+}
+/* 已学考点比例：1 = 全部没学，0 = 全部学过。用来压缩基础期 */
+function remainingRatio(cfg){
+  var ids=activeIds(cfg.includeInterview),tot=0,done=0;
+  ids.forEach(function(id){
+    var m=M[id];if(!m||!m.syl)return;
+    tot+=m.syl.length;
+    var p=(cfg.progress||{})[id]||{};
+    done+=Math.min(m.syl.length,(p.done||[]).length);
+  });
+  if(!tot)return 1;
+  return (tot-done)/tot;
 }
 
 /* ================= 状态与存储 ================= */
@@ -344,7 +377,8 @@ function loadStore(){
 }
 
 /* ================= 生成算法 ================= */
-function buildPhases(total){
+function buildPhases(total,remain){
+  remain=(remain===undefined)?1:clamp(remain,0.15,1);
   if(total<=7)return [{name:'考前冲刺',days:total}];
   if(total<=21){
     var pre=Math.max(3,Math.round(total*0.15)),rest=total-pre;
@@ -355,6 +389,11 @@ function buildPhases(total){
   if(total<=60){a2=Math.round(rest2*0.42);b2=Math.round(rest2*0.33)}
   else if(total<=120){a2=Math.round(rest2*0.46);b2=Math.round(rest2*0.30)}
   else{a2=Math.round(rest2*0.52);b2=Math.round(rest2*0.28)}
+  /* 已经学过的考点越多，基础期越短，省下的天数给强化和冲刺 */
+  var a0=a2;
+  a2=Math.round(a2*remain);
+  var freed=a0-a2;
+  b2+=Math.round(freed*0.5);
   c2=rest2-a2-b2;
   return [{name:'基础夯实',days:a2},{name:'强化突破',days:b2},{name:'冲刺模考',days:c2},{name:'考前一周',days:pre2}]
     .filter(function(p){return p.days>0});
@@ -497,12 +536,13 @@ function allocMinutes(total,ids,wmap,minB){
   }
   return out;
 }
-function syllabusTask(m,p,minutes,intensity){
-  var parts=[],qty=0,left=minutes,guard=0;
+function syllabusTask(m,p,minutes,intensity,skipSet){
+  var parts=[],qty=0,left=minutes,guard=0,sk=0;
   while(left>=12&&guard<4){
+    var idx=p.i%m.syl.length,lap=Math.floor(p.i/m.syl.length);
+    if(skipSet&&lap===0&&skipSet[idx]){p.i++;if(++sk>m.syl.length*2)break;continue}
     guard++;
-    var it=m.syl[p.i%m.syl.length];
-    var lap=Math.floor(p.i/m.syl.length);
+    var it=m.syl[idx];
     var cont=p.used>0;
     var remain=it.min-p.used;
     var use=Math.min(left,remain);
@@ -617,13 +657,13 @@ function buildDay(dateStr,dayIdx,phase,cfg,ctx){
       }
       var id=picked[si2++]||cand2[0].id,mo=M[id],r=null;
       if(pname==='基础夯实'){
-        r=syllabusTask(mo,ctx.ptr[id],sl.minutes,cfg.intensity);
+        r=syllabusTask(mo,ctx.ptr[id],sl.minutes,cfg.intensity,ctx.skip[id]);
         items.push({module:id,minutes:sl.minutes,kind:'精讲+练习',qty:r.qty,unit:r.unit,task:r.task+'｜先精讲/看解析，再同步练习，做完标注错因'});
       }else if(pname==='强化突破'){
-        r=syllabusTask(mo,ctx.ptr[id],sl.minutes,cfg.intensity);
+        r=syllabusTask(mo,ctx.ptr[id],sl.minutes,cfg.intensity,ctx.skip[id]);
         items.push({module:id,minutes:sl.minutes,kind:'专项刷题',qty:r.qty,unit:r.unit,task:'专项刷题：'+r.task+'｜限时完成，错题当场归因'});
       }else{
-        r=syllabusTask(mo,ctx.ptr[id],sl.minutes,cfg.intensity);
+        r=syllabusTask(mo,ctx.ptr[id],sl.minutes,cfg.intensity,ctx.skip[id]);
         items.push({module:id,minutes:sl.minutes,kind:'限时',qty:r.qty,unit:r.unit,task:'限时训练：'+r.task+'｜做完立刻对答案并归因'});
       }
       shorts.push(mo.short);
@@ -649,12 +689,17 @@ function generate(cfg,preserveManual){
   if(total>900)return {error:'计划周期过长（超过 900 天），请检查考试日期'};
   var ids=activeIds(cfg.includeInterview);
   cfg.weights=roundW(cfg.weights,ids);
-  var phases=buildPhases(total);
-  var ptr={},servedMin={};
+  var phases=buildPhases(total,remainingRatio(cfg));
+  var ptr={},servedMin={},skip={};
   var modsAll=activeModules(cfg.includeInterview);
-  modsAll.forEach(function(m){ptr[m.id]={i:0,used:0};servedMin[m.id]=0});
+  modsAll.forEach(function(m){
+    ptr[m.id]={i:0,used:0};servedMin[m.id]=0;
+    var set={},done=((cfg.progress||{})[m.id]||{}).done||[];
+    done.forEach(function(i){set[i]=1});
+    skip[m.id]=set;
+  });
   var rotMods=modsAll.filter(function(m){return m.id!=='changshi'});
-  var ctx={ptr:ptr,servedMin:servedMin,cumPool:0,rw:rotWeights(cfg,rotMods)};
+  var ctx={ptr:ptr,servedMin:servedMin,cumPool:0,rw:rotWeights(cfg,rotMods),skip:skip};
   var days=[],pi=0,inPhase=0;
   for(var i=0;i<total;i++){
     while(pi<phases.length-1&&inPhase>=phases[pi].days){pi++;inPhase=0}
@@ -853,11 +898,24 @@ function viewStats(){
 }
 
 /* ================= 视图：设置 ================= */
-function ratingRow(m,c){
+function progressRow(m,c){
+  var pr=(c.progress||{})[m.id]||{},done=(pr.done||[]).length;
   var opts=[['weak','弱'],['mid','中'],['strong','强']];
-  return '<div class="row"><div class="lab">'+esc(m.name)+'</div><div class="rating" style="flex:0 0 172px">'+
-    opts.map(function(o){return '<button data-act="rate" data-m="'+m.id+'" data-v="'+o[0]+'" class="'+(c.rating[m.id]===o[0]?'on':'')+'">'+o[1]+'</button>'}).join('')+
-  '</div></div>';
+  return '<div style="padding:10px 0;border-bottom:.5px solid var(--line)">'+
+    '<div style="display:flex;align-items:center;gap:8px">'+
+      '<div class="lab" style="flex:1;font-size:14.5px;min-width:0">'+esc(m.name)+
+        '<small>'+(done?('已勾选 '+done+'/'+m.syl.length+' 个考点'):('共 '+m.syl.length+' 个考点'))+'</small></div>'+
+      '<div class="rating" style="flex:0 0 132px">'+
+        opts.map(function(o){return '<button data-act="rate" data-m="'+m.id+'" data-v="'+o[0]+'" class="'+(c.rating[m.id]===o[0]?'on':'')+'">'+o[1]+'</button>'}).join('')+
+      '</div>'+
+    '</div>'+
+    '<div style="display:flex;align-items:center;gap:8px;margin-top:8px">'+
+      '<span class="muted" style="font-size:12.5px">粉笔正确率</span>'+
+      '<input type="number" data-acc="'+m.id+'" min="0" max="100" step="1" value="'+(typeof pr.acc==='number'?pr.acc:'')+'" placeholder="如 62" style="flex:0 0 82px;text-align:center;padding:7px 6px">'+
+      '<span class="muted" style="font-size:12.5px">%</span>'+
+      '<button class="btn sec sm" style="margin-left:auto" data-act="pickTopics" data-m="'+m.id+'">已学考点</button>'+
+    '</div>'+
+  '</div>';
 }
 function viewSetup(){
   var c=state.config,mods=activeModules(c.includeInterview),ids=mods.map(function(m){return m.id});
@@ -928,9 +986,10 @@ function viewSetup(){
     '<div class="row"><div class="lab">每周六加 30 分钟周复盘</div><div><button class="chip'+(c.weeklyReview?' on':'')+'" data-act="toggleReview">'+(c.weeklyReview?'开启':'关闭')+'</button></div></div>'+
     hint+
   '</div>'+
-  '<div class="h2">③ 你的基础和弱点<button class="chip" style="margin-left:auto;padding:5px 10px;font-size:12px" data-act="rerate">按自评重算分配</button></div><div class="card tight">'+
-    '<div class="muted" style="font-size:12.5px;padding:2px 0 6px">越弱的模块，系统会给越多时间。</div>'+
-    mods.map(function(m){return ratingRow(m,c)}).join('')+
+  '<div class="h2">③ 你的现有进度<button class="chip" style="margin-left:auto;padding:5px 10px;font-size:12px" data-act="accWeights">按正确率重算分配</button></div><div class="card tight">'+
+    '<div class="muted" style="font-size:12.5px;padding:2px 0 8px;line-height:1.65">把粉笔「做题报告／学习报告」里各模块的<b>正确率</b>填进来（选填），再点「已学考点」勾选你已经学完的部分。<br>系统会：正确率越低 → 分到的时间越多；已勾选的考点 → 生成时直接跳过，并相应压缩基础期。</div>'+
+    mods.map(function(m){return progressRow(m,c)}).join('')+
+    '<div class="btnrow"><button class="btn sec sm" data-act="accWeights">按正确率重算时间分配</button><button class="btn sec sm" data-act="rerate">按弱/中/强重算</button><button class="btn sec sm" data-act="clearProgress">清空进度</button></div>'+
   '</div>'+
   '<div class="h2">④ 时间分配（可拖动编辑）<span class="r" id="wsum">合计 '+Math.round(wsum)+'%</span></div><div class="card tight">'+
     '<div class="muted" style="font-size:12.5px;padding:2px 0 4px">这是各模块的<b>时间占比</b>，生成计划时按比例切分每天的时长。生成前会自动归一化到 100%。</div>'+
@@ -1029,6 +1088,20 @@ function openDaySheet(di){
     '</div>',
     '<button class="btn sec" data-act="closeSheet">取消</button><button class="btn" data-act="saveDay" data-i="'+di+'">保存</button>');
 }
+function openTopicsSheet(id){
+  var m=M[id],pr=(state.config.progress||{})[id]||{},done=pr.done||[];
+  var rows=m.syl.map(function(it,i){
+    var on=done.indexOf(i)>=0;
+    return '<div class="row" data-act="toggleTopic" data-m="'+id+'" data-t="'+i+'">'+
+      '<div class="lab">'+esc(it.t)+'<small>建议 '+it.min+' 分钟 · 练习 '+it.n+(m.unit||'题')+'</small></div>'+
+      '<button class="chip'+(on?' on':'')+'">'+(on?'已学':'未学')+'</button></div>';
+  }).join('');
+  openSheet(m.name+' · 已学考点',
+    '<div class="muted" style="font-size:12.5px;padding:0 0 4px;line-height:1.65">勾选你在粉笔上<b>已经学完或已经掌握</b>的考点（点整行即可切换）。重新生成计划时会从没勾选的地方开始，并按已学比例压缩基础期、把天数让给刷题和模考。</div>'+
+    '<div class="card tight" style="margin:10px 0 0">'+rows+'</div>'+
+    '<div class="fab-note">已勾选 '+done.length+' / '+m.syl.length+' 个考点</div>',
+    '<button class="btn sec" data-act="closeSheet">关闭</button><button class="btn" data-act="pickDone" data-m="'+id+'">完成</button>');
+}
 function openGenSheet(){
   openSheet('重新生成计划',
     '<div class="card tight"><div class="muted" style="line-height:1.7">重新生成会按最新参数重排所有日期。<br><b>已手动修改过的日子会被保留。</b><br>未手动修改的日子会重排（已打卡记录会清空）。</div></div>',
@@ -1099,7 +1172,16 @@ function onInput(e){
     return;
   }
   var key=el.getAttribute('data-cfg');
-  if(!key)return;
+  if(!key){
+    var accKey=el.getAttribute('data-acc');
+    if(accKey){
+      var prg2=(state.config.progress=state.config.progress||{});
+      prg2[accKey]=prg2[accKey]||{done:[]};
+      prg2[accKey].acc=(el.value==='')?null:clamp(Number(el.value)||0,0,100);
+      ui.dirty=true;saveSoon();renderHeader();
+    }
+    return;
+  }
   var p=key.split(':');
   if(p[0]==='weights'){
     var v=clamp(Number(el.value)||0,0,50);
@@ -1218,6 +1300,24 @@ function onClick(e){
     case 'rate':
       state.config.rating[el.dataset.m]=el.dataset.v;
       resetWeightsByRating();render();break;
+    case 'pickTopics':openTopicsSheet(el.dataset.m);break;
+    case 'pickDone':closeSheet();rerender(true);break;
+    case 'toggleTopic':
+      var tm=el.dataset.m,tt=Number(el.dataset.t);
+      var prg=(state.config.progress=state.config.progress||{});
+      prg[tm]=prg[tm]||{acc:null,done:[]};
+      prg[tm].done=prg[tm].done||[];
+      var tix=prg[tm].done.indexOf(tt);
+      if(tix>=0)prg[tm].done.splice(tix,1);else prg[tm].done.push(tt);
+      ui.dirty=true;save();openTopicsSheet(tm);break;
+    case 'accWeights':
+      state.config.weights=effWeights(state.config);
+      ui.dirty=true;save();render();
+      alert(hasAcc(state.config)?'已按正确率重算时间分配：正确率越低的模块，分到的时间越多。':'还没填正确率，已按「弱/中/强」自评重算。');
+      break;
+    case 'clearProgress':
+      state.config.progress={};
+      ui.dirty=true;save();render();break;
     case 'rerate':resetWeightsByRating();render();break;
     case 'equalize':
       var ids2=activeIds(state.config.includeInterview),e=Math.round(1000/ids2.length)/10;
@@ -1293,6 +1393,18 @@ function init(){
   if(st&&st.config&&st.config.preset!==PRESET&&!(st.days||[]).some(function(d){
     return d.manual||(d.blocks||[]).some(function(b){return b.done});
   })){st=null}/* 还没动过的示例计划：直接换成国考预置参数 */
+  /* 一次性迁移：把默认的申论高占比调低（只在用户没动过相关设置、也没填进度时） */
+  if(st&&st.config&&st.config.preset!==PRESET){
+    var cc=st.config;
+    var oldShenlun=(cc.rating&&cc.rating.shenlun==='weak')&&Math.abs(((cc.weights||{}).shenlun||0)-22.6)<0.25;
+    if(oldShenlun&&(!cc.progress||!Object.keys(cc.progress).length)){
+      cc.rating.shenlun='strong';
+      if(cc.rating.changshi==='mid')cc.rating.changshi='strong';
+      cc.preset=PRESET;
+      cc.weights=weightsFromRating(cc.rating,cc.includeInterview);
+      st.days=[];
+    }
+  }
   if(st&&st.config){
     state={config:Object.assign(defaultConfig(),st.config),days:st.days||[],phases:st.phases||[],created:st.created||''};
     state.config.rating=Object.assign(defaultConfig().rating,st.config.rating||{});
@@ -1302,6 +1414,7 @@ function init(){
     if(!state.config.windows||!state.config.windows.weekday||!state.config.windows.weekday.length){
       state.config.windows=defaultWindows();
     }
+    if(!state.config.progress)state.config.progress={};
   }else{
     state={config:defaultConfig(),days:[],phases:[]};
   }
