@@ -330,6 +330,7 @@ function defaultConfig(){
     rating:defaultRating(),weights:{},
     progress:defaultProgress(),
     wrongBook:415,
+    sync:defaultSync(),
     progressNote:'正确率来自粉笔做题报告（抓取于 '+t+'）：总做题 1070 题、总正确率 60.7%、估分 52、错题本积压 415 道、申论暂未在粉笔练习。'
   };
   cfg.weights=effWeights(cfg);
@@ -379,8 +380,14 @@ var CURVIEW='';
 
 function save(){
   if(!storageOK)return;
-  try{localStorage.setItem(KEY,JSON.stringify(state))}catch(e){storageOK=false;renderBanner()}
+  try{
+    var cj=JSON.stringify(state.config,function(k,v){return (k==='sync')?undefined:v});
+    if(cj!==cfgStamp){cfgStamp=cj;state.configAt=Date.now()}
+    localStorage.setItem(KEY,JSON.stringify(state));
+  }catch(e){storageOK=false;renderBanner()}
+  queueSync();
 }
+var cfgStamp='';
 var saveTimer=null;
 function saveSoon(){
   if(saveTimer)clearTimeout(saveTimer);
@@ -1078,6 +1085,7 @@ function closeSheet(){$('#sheet').classList.add('hidden')}
 function openMoreSheet(){
   openSheet('更多',
     '<div class="card tight" style="margin-bottom:0">'+
+      '<div class="row" data-act="syncSheet"><div class="lab">多设备同步<small>'+esc(syncStatusText())+'</small></div><span class="chev">›</span></div>'+
       '<div class="row" data-act="export" data-fmt="md"><div class="lab">导出计划书<small>Markdown 文本，可直接看/打印</small></div><span class="chev">›</span></div>'+
       '<div class="row" data-act="export" data-fmt="json"><div class="lab">导出数据备份<small>换设备/清缓存前务必导出</small></div><span class="chev">›</span></div>'+
       '<div class="row" data-act="import"><div class="lab">导入数据备份<small>从 JSON 文件恢复</small></div><span class="chev">›</span></div>'+
@@ -1085,7 +1093,7 @@ function openMoreSheet(){
       '<div class="row" data-act="goTab" data-tab="setup"><div class="lab">重新设置与生成<small>改考试日期、时间分配</small></div><span class="chev">›</span></div>'+
     '</div>'+
     '<div class="card"><div class="muted" style="line-height:1.7;font-size:13px">'+
-      '<b>怎么用</b><br>1. 「设置」里填考试日期、每天可学时长、各模块强弱 → 生成计划书。<br>2. 「今日」按顺序做，做完点右侧圆圈打卡。<br>3. 想改某天：点任务文字改内容，或用「＋加时段 / ⟲顺延时间 / ✎改目标」。<br>4. 想把某天的时间分配推广到整个阶段，点「⇉ 用本日分配套用到本阶段」。'+
+      '<b>怎么用</b><br>1. 「设置」里填考试日期、每天可学时长、各模块强弱 → 生成计划书。<br>2. 「今日」按顺序做，做完点右侧圆圈打卡。<br>3. 想改某天：点任务文字改内容，或用「＋加时段 / ⟲顺延时间 / ✎改目标」。<br>4. 想把某天的时间分配推广到整个阶段，点「⇉ 用本日分配套用到本阶段」。<br>5. 手机和电脑都要用 → 开「多设备同步」，打卡和修改会自动互通。'+
     '</div></div>',
     '<button class="btn sec" data-act="closeSheet">关闭</button>');
 }
@@ -1184,6 +1192,281 @@ function toMarkdown(){
   return L.join('\n');
 }
 
+/* ================= 多设备同步（私密 Gist + 端到端加密 + 同步码） ================= */
+var GH='https://api.github.com';
+var SYNC_FILE='kaogong-plan.enc';
+var syncing=false,syncTimer=null;
+function defaultSync(){return {on:false,gist:'',pass:'',token:'',lastAt:0,lastErr:''}}
+function ghHeaders(tok){
+  var h={'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','Content-Type':'application/json'};
+  if(tok)h['Authorization']='Bearer '+tok;
+  return h;
+}
+function b64u(buf){
+  var a=new Uint8Array(buf),s='';
+  for(var i=0;i<a.length;i++)s+=String.fromCharCode(a[i]);
+  return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function unb64u(str){
+  var s=String(str).replace(/-/g,'+').replace(/_/g,'/');
+  while(s.length%4)s+='=';
+  var bin=atob(s),a=new Uint8Array(bin.length);
+  for(var i=0;i<bin.length;i++)a[i]=bin.charCodeAt(i);
+  return a;
+}
+function deflateBytes(bytes){
+  if(typeof CompressionStream==='undefined')return Promise.resolve(null);
+  try{
+    var cs=new CompressionStream('deflate-raw');
+    var w=cs.writable.getWriter();w.write(bytes);w.close();
+    return new Response(cs.readable).arrayBuffer().then(function(b){return new Uint8Array(b)});
+  }catch(e){return Promise.resolve(null)}
+}
+function inflateBytes(bytes){
+  var ds=new DecompressionStream('deflate-raw');
+  var w=ds.writable.getWriter();w.write(bytes);w.close();
+  return new Response(ds.readable).arrayBuffer().then(function(b){return new Uint8Array(b)});
+}
+function deriveKey(pass,salt){
+  var enc=new TextEncoder();
+  return crypto.subtle.importKey('raw',enc.encode(pass),'PBKDF2',false,['deriveKey']).then(function(base){
+    return crypto.subtle.deriveKey({name:'PBKDF2',salt:salt,iterations:100000,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+  });
+}
+/* 打包：JSON →（deflate）→ AES-GCM → KG1.salt.iv.密文 */
+function packSync(obj,pass){
+  var raw=new TextEncoder().encode(JSON.stringify(obj));
+  var salt=crypto.getRandomValues(new Uint8Array(16));
+  var iv=crypto.getRandomValues(new Uint8Array(12));
+  return deflateBytes(raw).then(function(comp){
+    var body;
+    if(comp&&comp.length<raw.length){body=new Uint8Array(comp.length+1);body[0]=1;body.set(comp,1)}
+    else{body=new Uint8Array(raw.length+1);body[0]=0;body.set(raw,1)}
+    return deriveKey(pass,salt).then(function(key){
+      return crypto.subtle.encrypt({name:'AES-GCM',iv:iv},key,body);
+    }).then(function(ct){
+      return 'KG1.'+b64u(salt)+'.'+b64u(iv)+'.'+b64u(new Uint8Array(ct));
+    });
+  });
+}
+function unpackSync(str,pass){
+  var p=String(str||'').trim().split('.');
+  if(p.length!==4||p[0]!=='KG1')return Promise.reject(new Error('云端内容格式不对'));
+  var salt=unb64u(p[1]),iv=unb64u(p[2]),ct=unb64u(p[3]);
+  return deriveKey(pass,salt).then(function(key){
+    return crypto.subtle.decrypt({name:'AES-GCM',iv:iv},key,ct);
+  }).then(function(buf){
+    var raw=new Uint8Array(buf),flag=raw[0],rest=raw.slice(1);
+    if(flag===1)return inflateBytes(rest).then(function(b){return JSON.parse(new TextDecoder().decode(b))});
+    return JSON.parse(new TextDecoder().decode(rest));
+  },function(){throw new Error('解密失败：同步码不对，或云端数据被改过')});
+}
+function gistCreate(tok,content){
+  var files={};files[SYNC_FILE]={content:content};
+  return fetch(GH+'/gists',{method:'POST',headers:ghHeaders(tok),body:JSON.stringify({
+    description:'考公计划书 · 多设备同步（自动生成，请勿删除）',public:false,files:files
+  })}).then(function(r){
+    if(!r.ok)return r.text().then(function(t){throw new Error('创建失败 HTTP '+r.status+' '+t.slice(0,90))});
+    return r.json();
+  }).then(function(j){return j.id});
+}
+function gistWrite(tok,id,content){
+  var files={};files[SYNC_FILE]={content:content};
+  return fetch(GH+'/gists/'+id,{method:'PATCH',headers:ghHeaders(tok),body:JSON.stringify({files:files})}).then(function(r){
+    if(!r.ok)return r.text().then(function(t){throw new Error('写入失败 HTTP '+r.status+' '+t.slice(0,90))});
+    return true;
+  });
+}
+function gistRead(tok,id){
+  return fetch(GH+'/gists/'+id+'?t='+Date.now(),{headers:ghHeaders(tok||''),cache:'no-store'}).then(function(r){
+    if(!r.ok)return r.text().then(function(t){throw new Error('读取失败 HTTP '+r.status+' '+t.slice(0,90))});
+    return r.json();
+  }).then(function(j){
+    var f=j.files&&j.files[SYNC_FILE];
+    if(!f)throw new Error('云端文件不存在');
+    return f.content||'';
+  });
+}
+function randomPass(){var a=new Uint8Array(18);crypto.getRandomValues(a);return b64u(a)}
+function makeSyncCode(s){return 'KGSYNC1'+b64u(new TextEncoder().encode(JSON.stringify({g:s.gist,p:s.pass,t:s.token})))}
+function parseSyncCode(code){
+  code=String(code||'').replace(/\s+/g,'');
+  if(code.indexOf('KGSYNC1')!==0)throw new Error('同步码格式不对（应以 KGSYNC1 开头）');
+  var o=JSON.parse(new TextDecoder().decode(unb64u(code.slice(7))));
+  if(!o.g||!o.p)throw new Error('同步码内容不完整');
+  return o;
+}
+/* 云端负载：config 去掉 sync（token 不上传）+ days */
+function syncPayload(){
+  var c=JSON.parse(JSON.stringify(state.config));
+  delete c.sync;
+  return {v:1,at:Date.now(),configAt:state.configAt||0,config:c,days:state.days||[]};
+}
+function applyPayload(p){
+  if(!p||!p.config)return;
+  var keep=(state.config&&state.config.sync)||defaultSync();
+  state.config=p.config;
+  state.config.sync=keep;
+  if(p.days&&p.days.length)state.days=p.days;
+  state.configAt=p.configAt||state.configAt;
+}
+/* 合并一天：结构（任务内容/时段增删/时长）取 touchedAt 较新的一侧；
+   打卡状态按块 id 逐块取 doneAt 较新者 —— 这样"打过的卡"永远不会因为另一侧改了任务而丢。 */
+function mergeDay(l,r){
+  var lt=l.touchedAt||0,rt=r.touchedAt||0;
+  var newer=(lt>=rt)?l:r,older=(lt>=rt)?r:l;
+  var out=JSON.parse(JSON.stringify(newer));
+  out.touchedAt=Math.max(lt,rt);
+  var omap={};(older.blocks||[]).forEach(function(b){omap[b.id]=b});
+  (out.blocks||[]).forEach(function(b){
+    var ob=omap[b.id];
+    if(!ob)return;
+    if((ob.doneAt||0)>(b.doneAt||0)){b.done=ob.done;b.doneAt=ob.doneAt}
+  });
+  return out;
+}
+function mergeStates(A,B){
+  A=A||{};B=B||{};
+  var ac=A.configAt||0,bc=B.configAt||0;
+  var out={v:1,configAt:Math.max(ac,bc),config:(bc>=ac?(B.config||A.config):(A.config||B.config))||{},days:[]};
+  var map={},order=[];
+  (A.days||[]).forEach(function(d){if(d&&d.date&&!map[d.date]){map[d.date]=d;order.push(d.date)}});
+  (B.days||[]).forEach(function(d){
+    if(!d||!d.date)return;
+    var l=map[d.date];
+    if(!l){map[d.date]=d;order.push(d.date);return}
+    map[d.date]=mergeDay(l,d);
+  });
+  order.sort();
+  out.days=order.map(function(k){return map[k]});
+  return out;
+}
+function syncStatusText(){
+  var s=(state.config&&state.config.sync)||{};
+  if(!s.on||!s.gist)return '未开启 · 各设备各存各的';
+  return '已连接 · 上次同步 '+(s.lastAt?new Date(s.lastAt).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}):'还没同步')+(s.lastErr?' · 上次出错':'');
+}
+function queueSync(){
+  var s=state.config&&state.config.sync;
+  if(!s||!s.on||!s.gist||!s.token||syncing)return;
+  if(syncTimer)clearTimeout(syncTimer);
+  syncTimer=setTimeout(function(){syncNow(true)},8000);
+}
+function syncNow(quiet){
+  var s=state.config.sync;
+  if(!s||!s.on||!s.gist||!s.token){if(!quiet)alert('还没配置同步');return Promise.resolve(false)}
+  if(syncing)return Promise.resolve(false);
+  syncing=true;
+  var remote=null;
+  return gistRead(s.token,s.gist).catch(function(e){
+    if(!quiet)throw e;
+    return '';
+  }).then(function(raw){
+    if(raw&&raw.indexOf('KG1.')===0)return unpackSync(raw,s.pass).catch(function(){return null});
+    return null;
+  }).then(function(rem){
+    remote=rem;
+    var merged=remote?mergeStates(syncPayload(),remote):syncPayload();
+    applyPayload(merged);
+    return packSync(syncPayload(),s.pass);
+  }).then(function(packed){
+    return gistWrite(s.token,s.gist,packed);
+  }).then(function(){
+    state.config.sync.lastAt=Date.now();
+    state.config.sync.lastErr='';
+    save();render();
+    if(!quiet)alert('同步完成 ✅'+(remote?'（已合并云端进度）':''));
+    return true;
+  }).catch(function(e){
+    state.config.sync.lastErr=(e&&e.message)||String(e);
+    save();
+    if(!quiet)alert('同步失败：'+state.config.sync.lastErr);
+    return false;
+  }).then(function(v){syncing=false;return v});
+}
+function syncSupported(){
+  return (typeof crypto!=='undefined')&&!!crypto.subtle&&(typeof fetch==='function')&&(typeof btoa==='function')&&(typeof TextEncoder!=='undefined');
+}
+function openSyncSheet(){
+  if(!syncSupported()){
+    openSheet('多设备同步',
+      '<div class="warn">当前页面不是 https 环境（可能是用「文件」App 打开的本地文件，或局域网 http 地址），浏览器不允许做加密运算，所以同步用不了。<br><br>请用 <b>https://eternity7301.github.io/kaogong-planner/</b> 打开本站后再设置同步。本机数据不受影响，也可以用「导出/导入数据备份」手动搬。</div>',
+      '<button class="btn sec" data-act="closeSheet">知道了</button>');
+    return;
+  }
+  var s=state.config.sync||defaultSync();
+  var connected=!!(s.on&&s.gist&&s.token);
+  var body='';
+  if(connected){
+    body='<div class="card tight"><div class="muted" style="font-size:13px;line-height:1.8">'+
+      '状态：<b>已连接</b><br>同步仓库：Secret Gist <code>'+esc(String(s.gist).slice(0,8))+'…</code><br>'+
+      '上次同步：'+(s.lastAt?new Date(s.lastAt).toLocaleString('zh-CN'):'—')+
+      (s.lastErr?('<br><span style="color:var(--red)">上次出错：'+esc(s.lastErr)+'</span>'):'')+
+      '</div></div>'+
+      '<div class="btnrow"><button class="btn" data-act="syncNow">立即同步</button>'+
+      '<button class="btn sec" data-act="syncCode">显示同步码</button>'+
+      '<button class="btn sec" data-act="syncOff">断开（仅本机）</button></div>'+
+      '<div class="fab-note" style="text-align:left;padding-top:12px">'+
+      '· 打卡/改任务后约 8 秒自动同步一次，打开页面时也会自动拉取合并；<br>'+
+      '· 两台设备同时改也不会丢：按时间逐天合并，打卡记录取两边并集；<br>'+
+      '· 数据端到端加密后才上传，GitHub 上看到的是乱码。</div>';
+  }else{
+    body='<div class="card tight"><div class="muted" style="font-size:13px;line-height:1.85">'+
+      '<b>第一次设置（在电脑上做，手机上只要粘一次同步码）</b><br>'+
+      '① 点下面按钮去 GitHub 生成一个 token（已预选 gist 权限），点绿色 Generate 后复制；<br>'+
+      '② 粘到下面，点【创建同步】；<br>'+
+      '③ 点【显示同步码】，把同步码发到手机（微信发给自己）；<br>'+
+      '④ 手机打开本网站 → ⋯ → 多设备同步 → 粘贴同步码 → 连接。'+
+      '</div></div>'+
+      '<div class="btnrow"><a class="btn" style="text-decoration:none;text-align:center" target="_blank" rel="noopener" href="https://github.com/settings/tokens/new?scopes=gist&description=kaogong-plan-sync">① 去 GitHub 生成 token</a></div>'+
+      '<div class="h2">② 粘贴 token</div>'+
+      '<textarea id="syncTok" placeholder="ghp_… 或 github_pat_…" style="min-height:58px;font-size:14px"></textarea>'+
+      '<div class="btnrow"><button class="btn" data-act="syncCreate">创建同步</button></div>'+
+      '<div class="h2">已有同步码？</div>'+
+      '<textarea id="syncCodeIn" placeholder="KGSYNC1…" style="min-height:58px;font-size:12px"></textarea>'+
+      '<div class="btnrow"><button class="btn sec" data-act="syncJoin">用同步码连接</button></div>'+
+      '<div class="fab-note" style="text-align:left;padding-top:10px">token 只勾了 gist 权限（只能读写 Gist，动不了代码仓库），随时可在 GitHub 设置里撤销。</div>';
+  }
+  openSheet('多设备同步',body,'<button class="btn sec" data-act="closeSheet">关闭</button>');
+}
+function showSyncCode(){
+  var s=state.config.sync;
+  var code=makeSyncCode(s);
+  openSheet('同步码',
+    '<div class="card tight"><div class="muted" style="font-size:12.5px;line-height:1.75">'+
+      '把这段同步码发到另一台设备（微信发给自己最方便），在那边打开本网站 → ⋯ → 多设备同步 → 粘贴 → 连接。<br>'+
+      '<b style="color:var(--red)">同步码里含你的 GitHub token，等同于密码，别发到群聊或公开场合。</b>'+
+    '</div></div>'+
+    '<textarea id="codeOut" style="min-height:130px;font-size:12px;word-break:break-all">'+esc(code)+'</textarea>'+
+    '<div class="fab-note" style="text-align:left">· 云端是加密的乱码，光有链接也读不出来；<br>· 万一泄露：断开同步，去 GitHub 删掉那个 token 再重新建一次；<br>· 平时也建议用「导出数据备份」留一份本地备份。</div>',
+    '<button class="btn sec" data-act="copyCode">复制同步码</button><button class="btn" data-act="closeSheet">完成</button>');
+}
+function doSyncCreate(tok){
+  if(!syncSupported()){alert('当前不是 https 环境，无法加密同步');return}
+  var pass=randomPass();
+  packSync({v:1,configAt:0,config:{},days:[]},pass).then(function(empty){
+    return gistCreate(tok,empty);
+  }).then(function(id){
+    state.config.sync={on:true,gist:id,pass:pass,token:tok,lastAt:0,lastErr:''};
+    save();
+    return syncNow(true);
+  }).then(function(){
+    showSyncCode();
+  }).catch(function(e){
+    alert('创建失败：'+((e&&e.message)||e));
+  });
+}
+function doSyncJoin(code){
+  var o;
+  try{o=parseSyncCode(code)}catch(e){alert(e.message);return}
+  state.config.sync={on:true,gist:o.g,pass:o.p,token:o.t||'',lastAt:0,lastErr:''};
+  save();
+  syncNow(true).then(function(ok){
+    openSyncSheet();
+    if(!ok)alert('连接失败：'+(state.config.sync.lastErr||'未知错误'));
+  });
+}
+
 /* ================= 交互 ================= */
 function setCfgVal(path,val){
   var p=path.split(':');
@@ -1240,6 +1523,26 @@ function onClick(e){
     case 'goTab':ui.tab=el.dataset.tab;closeSheet();window.scrollTo(0,0);rerender();break;
     case 'closeSheet':closeSheet();break;
     case 'more':openMoreSheet();break;
+    case 'syncSheet':openSyncSheet();break;
+    case 'syncCreate':
+      var stok=(($('#syncTok')||{}).value||'').trim();
+      if(!stok){alert('请先粘贴 GitHub token');break}
+      doSyncCreate(stok);break;
+    case 'syncJoin':
+      var scode=(($('#syncCodeIn')||{}).value||'').trim();
+      if(!scode){alert('请先粘贴同步码');break}
+      doSyncJoin(scode);break;
+    case 'syncNow':syncNow(false);break;
+    case 'syncCode':showSyncCode();break;
+    case 'syncOff':
+      state.config.sync=defaultSync();save();render();openSyncSheet();break;
+    case 'copyCode':
+      var ta=$('#codeOut');
+      if(ta){
+        ta.focus();ta.select();
+        try{alert(document.execCommand('copy')?'已复制到剪贴板':'请长按上面的框手动复制')}catch(e){alert('请长按上面的框手动复制')}
+      }
+      break;
     case 'toggleWeek':
       var k=el.dataset.k;
       ui.openWeeks[k]=!(ui.openWeeks[k]!==undefined?ui.openWeeks[k]:true);
@@ -1248,7 +1551,7 @@ function onClick(e){
       ui.openDays[day.date]=!ui.openDays[day.date];
       rerender(true);break;
     case 'toggleDone':
-      day.blocks[bi].done=!day.blocks[bi].done;save();rerender(true);break;
+      day.blocks[bi].done=!day.blocks[bi].done;day.blocks[bi].doneAt=Date.now();day.touchedAt=Date.now();save();rerender(true);break;
     case 'editBlock':openBlockSheet(di,bi);break;
     case 'editDay':openDaySheet(di);break;
     case 'saveBlock':
@@ -1260,23 +1563,23 @@ function onClick(e){
       var q=Number($('#ebQty').value)||0;
       if(q>0){b.qty=q;b.unit=(M[b.module]||{}).unit||'题'}else{delete b.qty;delete b.unit}
       b.end=minToHM(HMToMin(b.start)+b.minutes);
-      day.manual=true;save();closeSheet();rerender(true);break;
+      day.manual=true;day.touchedAt=Date.now();save();closeSheet();rerender(true);break;
     case 'saveDay':
       day.goal=$('#edGoal').value;day.note=$('#edNote').value;
-      day.manual=true;save();closeSheet();rerender(true);break;
+      day.manual=true;day.touchedAt=Date.now();save();closeSheet();rerender(true);break;
     case 'delBlock':
-      day.blocks.splice(bi,1);day.manual=true;save();closeSheet();rerender(true);break;
+      day.blocks.splice(bi,1);day.manual=true;day.touchedAt=Date.now();save();closeSheet();rerender(true);break;
     case 'addBlock':
       var st=day.blocks.length?day.blocks[day.blocks.length-1].end:firstStart(state.config,pDate(day.date).getDay()===0||pDate(day.date).getDay()===6);
       var nb={id:uid(),module:selectableModules(state.config.includeInterview)[0].id,minutes:45,start:st,end:minToHM(HMToMin(st)+45),task:'',done:false};
-      day.blocks.push(nb);day.manual=true;save();
+      day.blocks.push(nb);day.manual=true;day.touchedAt=Date.now();save();
       openBlockSheet(di,day.blocks.length-1);break;
     case 'reflow':
       if(!day||!day.blocks.length)break;
       var isW=(pDate(day.date).getDay()===0||pDate(day.date).getDay()===6);
       var st2=day.blocks[0].start||firstStart(state.config,isW);
       sequence(day.blocks,st2,state.config.breakMinutes);
-      day.manual=true;save();closeSheet();rerender(true);break;
+      day.manual=true;day.touchedAt=Date.now();save();closeSheet();rerender(true);break;
     case 'toggleRest':
       day.rest=!day.rest;
       if(day.rest){
@@ -1286,7 +1589,7 @@ function onClick(e){
         var isW2=(pDate(day.date).getDay()===0||pDate(day.date).getDay()===6);
         sequence(day.blocks,firstStart(state.config,isW2),state.config.breakMinutes);
       }
-      day.manual=true;save();closeSheet();rerender(true);break;
+      day.manual=true;day.touchedAt=Date.now();save();closeSheet();rerender(true);break;
     case 'applyRatio':
       var src={},tot=0;
       day.blocks.forEach(function(b){src[b.module]=(src[b.module]||0)+b.minutes;tot+=b.minutes});
@@ -1321,7 +1624,7 @@ function onClick(e){
         var endT=HMToMin(merged.length?merged[merged.length-1].end:'00:00');
         var lim=HMToMin(lastEnd(state.config,isW3));
         d.warn=(lim>0&&endT>lim)?('按这份分配要排到 '+minToHM(endT)+'，超出最后一个时段（'+lastEnd(state.config,isW3)+'），建议再压缩或有针对性地砍掉一块。'):'';
-        d.blocks=merged;changed++;
+        d.blocks=merged;d.touchedAt=Date.now();changed++;
       });
       save();closeSheet();rerender(true);
       alert('已套用到本阶段 '+changed+' 天（手动改过的日子未改动）');
@@ -1410,6 +1713,7 @@ function doGenerate(keepManual){
   var r=generate(state.config);
   if(r.error){alert(r.error);return}
   var kept=r.days.keptManual||0;delete r.days.keptManual;
+  r.days.forEach(function(d){d.touchedAt=Date.now()});
   state.days=r.days;state.phases=r.phases;state.created=todayStr();
   ui.dirty=false;ui.openWeeks={};ui.openDays={};
   save();ui.tab='today';render();window.scrollTo(0,0);
@@ -1444,6 +1748,7 @@ function init(){
       state.config.windows=defaultWindows();
     }
     if(!state.config.progress)state.config.progress={};
+    if(!state.config.sync)state.config.sync=defaultSync();
   }else{
     state={config:defaultConfig(),days:[],phases:[]};
   }
@@ -1481,6 +1786,12 @@ function init(){
     fr.readAsText(f);
   });
   render();
+  /* 记录初始配置指纹，之后只有配置真的变了才更新 configAt */
+  try{cfgStamp=JSON.stringify(state.config,function(k,v){return (k==='sync')?undefined:v})}catch(e){}
+  /* 已配置同步：打开页面时静默拉取合并 */
+  if(state.config.sync&&state.config.sync.on&&state.config.sync.gist&&state.config.sync.token){
+    setTimeout(function(){syncNow(true)},1500);
+  }
   /* 部署成网站时注册 Service Worker：可加到主屏幕、断网也能打开 */
   try{
     if(typeof navigator!=='undefined'&&navigator.serviceWorker&&typeof location!=='undefined'&&String(location.protocol).indexOf('http')===0){
